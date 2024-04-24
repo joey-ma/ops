@@ -34,6 +34,7 @@ async function main({ g, c }, columnId) {
   // Retrieve all issue numbers from a column
   const issueNums = getIssueNumsFromColumn(columnId);
   for await (const issueNum of issueNums) {
+    console.log("🚀 ~ main ~ issueNums:", issueNum)
     const timeline = await getTimeline(issueNum, github, context);
     const assignees = await getAssignees(issueNum);
     // Error handling
@@ -42,7 +43,7 @@ async function main({ g, c }, columnId) {
       continue;
     }
 
-    // Add and remove labels as well as post comment if the issue's timeline indicates the issue is inactive, to be updated or up to date accordingly
+    // Add, remove labels, and post comment if the issue's timeline indicates the issue is inactive, needs an update, or is current.
     const responseObject = await isTimelineOutdated(timeline, issueNum, assignees)
 
     if (responseObject.result === true && responseObject.labels === toUpdateLabel) { // 7-day outdated, add 'To Update !' label
@@ -50,7 +51,8 @@ async function main({ g, c }, columnId) {
       await removeLabels(issueNum, statusUpdatedLabel, inactiveLabel);
       await addLabels(issueNum, responseObject.labels);
       await postComment(issueNum, assignees, toUpdateLabel);
-    } else if (responseObject.result === true && responseObject.labels === inactiveLabel) { // 14-day outdated, add '2 Weeks Inactive' label
+    }
+    if (responseObject.result === true && responseObject.labels === inactiveLabel) { // 14-day outdated, add '2 Weeks Inactive' label
       console.log(`Going to ask for an update now for issue #${issueNum}`);
       await removeLabels(issueNum, toUpdateLabel, statusUpdatedLabel);
       await addLabels(issueNum, responseObject.labels);
@@ -71,6 +73,8 @@ async function main({ g, c }, columnId) {
  * @returns {Array} of issue numbers
  */
 async function* getIssueNumsFromColumn(columnId) {
+  if (!columnId) console.error(`column id "${columnId}" is falsy.`);
+
   let page = 1;
   while (page < 100) {
     try {
@@ -79,10 +83,12 @@ async function* getIssueNumsFromColumn(columnId) {
         per_page: 100,
         page: page
       });
+      console.log("🚀 ~ function*getIssueNumsFromColumn ~ results:", results)
       if (results.data.length) {
         for (let card of results.data) {
           if (card.hasOwnProperty('content_url')) {
             const arr = card.content_url.split('/');
+            console.log("🚀 ~ function*getIssueNumsFromColumn ~ arr:", arr)
             yield arr.pop()
           }
         }
@@ -102,43 +108,46 @@ async function* getIssueNumsFromColumn(columnId) {
  * @param {Array} timeline a list of events in the timeline of an issue, retrieved from the issues API
  * @param {Number} issueNum the issue's number
  * @param {String} assignees a list of the issue's assignee's login username
- * @returns {Object} with result: true/false if timeline indicates the issue is outdated/inactive and labels: a string label that should be removed, retained or added to the issue
+ * @returns {Object} { result, labels } 
+ * - result: a boolean if timeline indicates the issue is outdated/inactive.
+ * - labels: a string label that should be removed, retained or added to the issue.
  */
 function isTimelineOutdated(timeline, issueNum, assignees) {
   let lastAssignedTimestamp = null;
   let lastCommentTimestamp = null;
 
   for (let i = timeline.length - 1; i >= 0; i--) {
-    let eventObj = timeline[i];
-    let eventType = eventObj.event;
-    const isLinkedIssue = findLinkedIssue(eventObj.source.issue.body) == issueNum
-    // checks if the 'body' (comment) of the event mentions fixes/resolves/closes this current issue
-    let isOpenLinkedPullRequest = eventType === 'cross-referenced' && isLinkedIssue && eventObj.source.issue.state === 'open';
+    const eventObj = timeline[i];
+    const eventType = eventObj.event;
 
-    // If cross-referenced and fixed/resolved/closed by assignee and the pull
-    // request is open, remove all update-related labels
-    // Once a PR is opened, we remove labels because we focus on the PR not the issue.
-    if (isOpenLinkedPullRequest && assignees.includes(eventObj.actor.login)) {
-      console.log(`Assignee fixes/resolves/closes Issue #${issueNum} in with an open pull request, remove all update-related labels`);
-      return { result: false, labels: '' } // remove all three labels
+    const isCrossReferencedEvent = eventType === 'cross-referenced';
+    // Checks if the 'body' (comment) of the event mentions fixes/resolves/closes this current issue.
+    const isLinkedIssue = isCrossReferencedEvent ? findLinkedIssue(eventObj.source.issue.body) == issueNum : false;
+    // If cross-referenced and fixed/resolved/closed by assignee and the pull request is open, remove all update-related labels.
+    const isOpenLinkedPullRequest = isCrossReferencedEvent && isLinkedIssue && eventObj.source.issue.state === 'open';
+
+    if (isOpenLinkedPullRequest) {
+      // Once a PR is opened, we remove labels because we focus on the PR not the issue.
+      if (isOpenLinkedPullRequest && assignees.includes(eventObj.actor.login)) {
+        console.log(`Assignee fixes/resolves/closes Issue #${issueNum} in with an open pull request, remove all update-related labels`);
+        return { result: false, labels: '' } // Remove all three labels
+      }
     }
 
-    // If the event is a linked PR and the PR is closed, it will continue through the
-    // rest of the conditions to receive the appropriate label.
-    else if (eventType === 'cross-referenced' && eventObj.source.issue.state === 'closed') {
+    // If the event is a linked PR and the PR is closed, continue the conditional checks to return the appropriate { result, labels }.
+    if (isCrossReferencedEvent && eventObj.source.issue.state === 'closed') {
       console.log(`Pull request linked to Issue #${issueNum} is closed.`);
     }
 
     let eventTimestamp = eventObj.updated_at || eventObj.created_at;
 
-    // Update the lastCommentTimestamp if this is the last (most recent) comment by an assignee
-    const isCommentByAssignees = assignees.includes(eventObj.actor.login)
-    if (!lastCommentTimestamp && eventType === 'commented' && isCommentByAssignees) {
+    // Update the lastCommentTimestamp if this is the last (most recent) comment by an assignee.
+    if (!lastCommentTimestamp && eventType === 'commented' && assignees.includes(eventObj.actor.login)) {
       lastCommentTimestamp = eventTimestamp;
     }
 
     // Update the lastAssignedTimestamp if this is the last (most recent) time an assignee was assigned to the issue
-    else if (!lastAssignedTimestamp && eventType === 'assigned' && assignees.includes(eventObj.assignee.login)) {
+    if (!lastAssignedTimestamp && eventType === 'assigned' && assignees.includes(eventObj.assignee.login)) {
       lastAssignedTimestamp = eventTimestamp;
     }
   }
@@ -186,15 +195,18 @@ async function removeLabels(issueNum, ...labels) {
   for (let label of labels) {
     try {
       // https://octokit.github.io/rest.js/v18#issues-remove-label
-      await github.rest.issues.removeLabel({
+      const response = await github.rest.issues.removeLabel({
         owner: context.repo.owner,
         repo: context.repo.repo,
         issue_number: issueNum,
         name: label,
       });
       console.log(`Removed "${label}" from issue #${issueNum}`);
+      console.log(`Remaining labels: "${response}"`);
     } catch (err) {
-      console.error(`Function failed to remove labels. Please refer to the error below: \n `, err);
+      const { message } = err;
+      if (err.status === 404) console.log({ status: 404, message, label })
+      else console.error(`Function failed to remove labels. Please refer to the error below: \n `, err);
     }
   }
 }
